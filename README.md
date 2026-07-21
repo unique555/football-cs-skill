@@ -140,9 +140,12 @@
 ### API-Football
 
 ```bash
-API_KEY=f8e787c088dbbb7d831c670ab375a7bc
+# API Key 从环境变量读取，禁止在代码或文档中写入明文
+export API_FOOTBALL_KEY=your_api_key_here
 BASE_URL=https://v3.football.api-sports.io/
 ```
+
+> ⚠️ **调用方式**：API-Football 是 REST API，必须用 curl（带 `x-apisports-key` 请求头）或 `requests` 直接调用，**不要使用遵守 robots.txt 的网页抓取工具**（会被误拦截）。
 
 **常用端点：**
 - `/fixtures` - 比赛信息
