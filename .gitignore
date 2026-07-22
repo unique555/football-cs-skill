@@ -1,26 +1,33 @@
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Environment
+# 密钥和环境
 .env
-.env.local
+*.env
+.env.*
 
-# Temporary files
-*.tmp
-*.temp
+# 状态和缓存
+state/
+*.json.bak
+backtest_cache.json
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+venv/
+.venv/
+
+# 日志
+*.log
+/tmp/
+
+# 本地开发
+.idea/
+.vscode/
+*.swp
+*.swo
+ssh_helper.py
+capture_bundle.py
+e2e_test.py
+report_test.py
+remote/
