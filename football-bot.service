@@ -1,0 +1,30 @@
+[Unit]
+Description=Football-CS Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=footballbot
+Group=footballbot
+WorkingDirectory=/opt/football-bot
+EnvironmentFile=/opt/football-bot/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/football-bot/venv/bin/python /opt/football-bot/app.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0027
+ReadWritePaths=/opt/football-bot/state
+
+[Install]
+WantedBy=multi-user.target

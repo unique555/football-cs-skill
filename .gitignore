@@ -1,0 +1,29 @@
+# 敏感文件
+.env
+.env.bak*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# 运行时状态（含预测存档、Elo、回测缓存）
+state/
+*.log
+/tmp/
+
+# 备份文件
+*.bak*
+*.backup*
+app.candidate.py
+app.thinking-candidate.py
+_app_candidate_test.py
+
+# 测试/工具脚本（不发布）
+capture_bundle.py
+e2e_test.py
+report_test.py
+ssh_helper.py
+out_*.json
+err.txt
