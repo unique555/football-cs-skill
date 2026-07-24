@@ -1,7 +1,8 @@
-# 密钥和环境
+# 密钥和环境（.env.example 为模板，保留在版本控制中）
 .env
 *.env
 .env.*
+!.env.example
 
 # 状态和缓存
 state/

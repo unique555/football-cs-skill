@@ -10,7 +10,7 @@
   1. 拉取历史 finished fixtures（仅一次，有缓存就复用）
   2. 对每场比赛（跳过每队前 WARMUP_ROUNDS 轮），用赛前数据构建 bundle
   3. 调用 strength_model.compute_strength(bundle) 得到预测概率
-  4. 与实际结果比较，计算 Brier Score（越低越好，0.333=随机）
+  4. 与实际结果比较，计算 Brier Score（越低越好，3分类随机基准≈0.667）
   5. 网格搜索关键参数，把最优参数写入 state/model_params.json
 """
 from __future__ import annotations
@@ -40,51 +40,53 @@ PARAMS_FILE  = STATE_DIR / "model_params.json"
 
 # ── 回测联赛配置 ─────────────────────────────────────────────────────────────
 LEAGUES = [
-    # 五大联赛（3赛季）
-    (39,  2023, "PL-2023"),
-    (39,  2024, "PL-2024"),
-    (39,  2025, "PL-2025"),
-    (61,  2024, "Ligue1-2024"),
-    (61,  2025, "Ligue1-2025"),
-    (78,  2024, "Bundesliga-2024"),
-    (78,  2025, "Bundesliga-2025"),
-    (94,  2024, "Primeira-2024"),
-    (94,  2025, "Primeira-2025"),
-    (135, 2024, "SerieA-2024"),
-    (135, 2025, "SerieA-2025"),
-    (140, 2024, "LaLiga-2024"),
-    (140, 2025, "LaLiga-2025"),
-    # 欧洲次级联赛
-    (88,  2024, "Eredivisie-2024"),
-    (88,  2025, "Eredivisie-2025"),
-    (197, 2024, "SuperLig-2024"),
-    (197, 2025, "SuperLig-2025"),
-    (218, 2024, "Belgian-2024"),
-    (218, 2025, "Belgian-2025"),
-    # 北欧（进行中赛季，与机器人实际服务场景接近）
-    (103, 2025, "Eliteserien-2025"),
-    (103, 2026, "Eliteserien-2026"),
-    (113, 2025, "Allsvenskan-2025"),
-    (113, 2026, "Allsvenskan-2026"),
-    (244, 2025, "Veikkausliiga-2025"),
-    (244, 2026, "Veikkausliiga-2026"),
-    # 美洲（不同风格：巴西/阿根廷/MLS）
-    (128, 2024, "ArgPrimera-2024"),
-    (128, 2025, "ArgPrimera-2025"),
+    # ── 五大联赛 + 联赛二级部（北单主力赛事）────────────────────────────
+    (39,  2023, "PL-2023"),       (39,  2024, "PL-2024"),       (39,  2025, "PL-2025"),
+    (40,  2024, "Championship-2024"), (40, 2025, "Championship-2025"),
+    (61,  2024, "Ligue1-2024"),   (61,  2025, "Ligue1-2025"),
+    (62,  2024, "Ligue2-2024"),   (62,  2025, "Ligue2-2025"),
+    (78,  2024, "BL-2024"),       (78,  2025, "BL-2025"),
+    (79,  2024, "BL2-2024"),      (79,  2025, "BL2-2025"),
+    (94,  2024, "Primeira-2024"), (94,  2025, "Primeira-2025"),
+    (135, 2024, "SerieA-2024"),   (135, 2025, "SerieA-2025"),
+    (136, 2024, "SerieB-2024"),   (136, 2025, "SerieB-2025"),
+    (140, 2024, "LaLiga-2024"),   (140, 2025, "LaLiga-2025"),
+    (141, 2024, "LaLiga2-2024"),  (141, 2025, "LaLiga2-2025"),
+    # ── 其他欧洲北单联赛 ────────────────────────────────────────────────
+    (88,  2024, "Eredivisie-2024"),   (88,  2025, "Eredivisie-2025"),
+    (89,  2024, "Eerste-2024"),       (89,  2025, "Eerste-2025"),
+    (103, 2025, "Eliteserien-2025"),  (103, 2026, "Eliteserien-2026"),
+    (113, 2025, "Allsvenskan-2025"),  (113, 2026, "Allsvenskan-2026"),
+    (119, 2025, "Superliga-DK-2025"),
+    (179, 2024, "ScottishPL-2024"),   (179, 2025, "ScottishPL-2025"),
+    (197, 2024, "GreekSL-2024"),      (197, 2025, "GreekSL-2025"),
+    (203, 2024, "SuperLig-TR-2024"),  (203, 2025, "SuperLig-TR-2025"),
+    (207, 2025, "CzechLiga-2025"),
+    (218, 2024, "Belgian-2024"),      (218, 2025, "Belgian-2025"),
+    (244, 2025, "Veikkausliiga-2025"),(244, 2026, "Veikkausliiga-2026"),
+    # ── 欧洲杯赛（单场模式）────────────────────────────────────────────
+    (2,   2024, "UCL-2024"),          (2,   2025, "UCL-2025"),
+    (3,   2024, "UEL-2024"),          (3,   2025, "UEL-2025"),
+    # ── 美洲 ──────────────────────────────────────────────────────────
+    (128, 2024, "ArgPrimera-2024"),   (128, 2025, "ArgPrimera-2025"),
     (233, 2025, "MLS-2025"),
-    (253, 2025, "BrazilianA-2025"),
-    (253, 2026, "BrazilianA-2026"),
-    # 亚洲（J联赛/韩K联赛）
-    (239, 2024, "JLeague-2024"),
-    (239, 2025, "JLeague-2025"),
+    (253, 2025, "BrazilianA-2025"),   (253, 2026, "BrazilianA-2026"),
+    (71,  2024, "BrazilianB-2024"),   (71,  2025, "BrazilianB-2025"),
+    (262, 2024, "LigaMX-2024"),       (262, 2025, "LigaMX-2025"),
+    # ── 亚洲 ──────────────────────────────────────────────────────────
+    (239, 2024, "JLeague-2024"),      (239, 2025, "JLeague-2025"),
+    (240, 2024, "J2League-2024"),     (240, 2025, "J2League-2025"),
     (235, 2025, "KLeague-2025"),
-    # 中东（沙特联）
-    (265, 2025, "SaudiPL-2025"),
-    (265, 2026, "SaudiPL-2026"),
-    # 中国超级联赛
-    (169, 2025, "CSL-2025"),
+    (236, 2024, "KLeague2-2024"),     (236, 2025, "KLeague2-2025"),
+    (169, 2024, "CSL-2024"),          (169, 2025, "CSL-2025"),
+    # ── 大洋洲 ────────────────────────────────────────────────────────
+    (188, 2024, "ALeague-2024"),      (188, 2025, "ALeague-2025"),
+    # ── 中东 ──────────────────────────────────────────────────────────
+    (265, 2024, "SaudiPL-2024"),      (265, 2025, "SaudiPL-2025"),  (265, 2026, "SaudiPL-2026"),
+    # ── 中亚（乌兹别克超）────────────────────────────────────────────
+    (369, 2023, "UzbekSL-2023"),      (369, 2024, "UzbekSL-2024"),  (369, 2025, "UzbekSL-2025"),
 ]
-FAST_LEAGUES = [(244, 2025, "Veikkausliiga-2025"), (39, 2024, "PL-2024")]
+FAST_LEAGUES = [(244, 2025, "Veikkausliiga-2025"), (39, 2024, "PL-2024"), (78, 2024, "BL-2024")]
 
 WARMUP_ROUNDS = 6   # 每队前 N 场不参与回测（数据太少）
 API_RATE = 0.4      # 每次 API 请求间隔（秒）
@@ -356,22 +358,32 @@ def calibration_stats(preds):
 
 def run_predictions_with_params(all_bundles_results, sm_module, params):
     """用给定参数集对所有 bundle 跑预测，返回 predictions list。
-    关键优化：回测期间 patch 掉 Elo 的磁盘 IO（每次调用不读写文件，只做内存计算），
-    否则 8000场 × 125参数组 = 100万次磁盘 IO，耗时数小时。
+
+    关键优化：回测期间用内存字典替代 Elo 磁盘 IO，同时保持 Elo 按时间序列累积
+    （修复之前 lambda: {} 导致每场比赛都从空 Elo 开始、与生产版行为不一致的问题）。
     """
     # 临时替换模块参数
     orig_params = {k: getattr(sm_module, k.upper()) for k in params
                    if hasattr(sm_module, k.upper())}
-    # patch 掉 Elo 文件 IO
     orig_load = sm_module._elo_load
     orig_save = sm_module._elo_save
+    # 内存 Elo 存储——按时间顺序累积，避免磁盘 IO 且与生产逻辑一致
+    elo_mem: dict = {}
+
+    def elo_load_mem():
+        return elo_mem
+
+    def elo_save_mem(data):
+        elo_mem.clear()
+        elo_mem.update(data)
+
     try:
         for k, v in params.items():
             key = k.upper()
             if hasattr(sm_module, key):
                 setattr(sm_module, key, v)
-        sm_module._elo_load = lambda: {}          # 返回空字典，不读文件
-        sm_module._elo_save = lambda data: None   # 不写文件
+        sm_module._elo_load = elo_load_mem
+        sm_module._elo_save = elo_save_mem
         preds = []
         for bundle, actual in all_bundles_results:
             try:
@@ -384,7 +396,7 @@ def run_predictions_with_params(all_bundles_results, sm_module, params):
         return preds
     finally:
         for k, v in orig_params.items():
-            setattr(sm_module, k, v)
+            setattr(sm_module, k.upper(), v)
         sm_module._elo_load = orig_load
         sm_module._elo_save = orig_save
 
@@ -479,7 +491,7 @@ def main():
     current_preds  = run_predictions_with_params(all_bundles_results, sm, current_params)
     current_brier  = brier_score(current_preds)
     print(f"\nCurrent params: {current_params}")
-    print(f"Current Brier: {current_brier:.4f} (random=0.333, perfect=0)")
+    print(f"Current Brier: {current_brier:.4f} (random≈0.667 for 3-class, perfect=0)")
 
     # 准确率（以最高概率方向为预测）
     correct = sum(1 for ph,pd,pa,actual in current_preds

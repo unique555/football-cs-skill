@@ -22,6 +22,11 @@ try:
 except Exception:  # pragma: no cover - model is optional; bot must still run without it
     strength_model = None
 
+try:
+    import jingcai as _jingcai
+except Exception:  # pragma: no cover
+    _jingcai = None
+
 DOTENV_PATH = Path(__file__).with_name(".env")
 if DOTENV_PATH.is_file() and os.access(DOTENV_PATH, os.R_OK):
     load_dotenv(DOTENV_PATH)
@@ -60,6 +65,10 @@ EXA_TEXT_MAX_CHARACTERS = max(500, min(int(os.getenv("EXA_TEXT_MAX_CHARACTERS", 
 EXA_TIMEOUT = int(os.getenv("EXA_TIMEOUT_SECONDS", "45"))
 EXA_MAX_RETRIES = int(os.getenv("EXA_MAX_RETRIES", "2"))
 EXA_MIN_INTERVAL = float(os.getenv("EXA_MIN_INTERVAL_SECONDS", "0.25"))
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+TAVILY_BASE_URL = "https://api.tavily.com"
+TAVILY_TIMEOUT = int(os.getenv("TAVILY_TIMEOUT_SECONDS", "30"))
+TAVILY_MAX_RESULTS = max(1, min(int(os.getenv("TAVILY_MAX_RESULTS", "5")), 10))
 SKILL_PATH = Path(os.getenv("SKILL_PATH", "/opt/football-bot/skill/SKILL.md"))
 MC_TOOL_PATH = Path(os.getenv("MC_TOOL_PATH", "/opt/football-bot/skill/tools/mc_football.py"))
 MC_TIMEOUT = max(10, min(int(os.getenv("MC_TIMEOUT_SECONDS", "90")), 180))
@@ -120,6 +129,11 @@ def split_message(text: str, limit: int = 3800) -> list[str]:
     if current:
         chunks.append(current.rstrip())
     return chunks
+
+
+async def _noop_coro() -> None:
+    """占位协程，用于 Tavily 未配置时的 asyncio.gather 兜底。"""
+    return None
 
 
 class TelegramAPIError(RuntimeError):
@@ -381,7 +395,8 @@ class ExaClient:
             })
         return output
 
-    async def research_fixture(self, info: dict[str, Any]) -> dict[str, Any]:
+    async def research_fixture(self, info: dict[str, Any],
+                               minutes_to_kickoff: Optional[int] = None) -> dict[str, Any]:
         if not self.configured:
             return {
                 "configured": False,
@@ -393,11 +408,19 @@ class ExaClient:
         home, away = str(info.get("home") or ""), str(info.get("away") or "")
         league = str(info.get("league") or "")
         kickoff = str(info.get("date") or "")[:10]
-        queries = [
-            f"{home} injury suspension return squad news press conference {kickoff}",
-            f"{away} injury suspension return squad news press conference {kickoff}",
-            f"{home} vs {away} {league} team news predicted lineup confirmed lineup {kickoff}",
-        ]
+        # 距开赛 ≤60 分钟：侧重确认首发；否则侧重伤病/赛前综述
+        if minutes_to_kickoff is not None and minutes_to_kickoff <= 60:
+            queries = [
+                f"{home} {away} confirmed starting lineup XI {kickoff}",
+                f"{home} {away} official lineup {league} today",
+                f"{home} injury suspension latest {kickoff}",
+            ]
+        else:
+            queries = [
+                f"{home} injury suspension return squad news press conference {kickoff}",
+                f"{away} injury suspension return squad news press conference {kickoff}",
+                f"{home} vs {away} {league} team news predicted lineup confirmed lineup {kickoff}",
+            ]
         raw_searches = await asyncio.gather(
             *(self.search(query) for query in queries),
             return_exceptions=True,
@@ -462,6 +485,76 @@ class ExaClient:
                 "Search results are evidence leads, not automatically confirmed facts.",
                 "Use fetched page text and source reliability to distinguish confirmed absences, doubts, predicted lineups, and official lineups.",
             ],
+        }
+
+
+class TavilyClient:
+    """Tavily 网络搜索客户端，作为 Exa 的并行/兜底搜索源。"""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+
+    @property
+    def configured(self) -> bool:
+        return bool(TAVILY_API_KEY)
+
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        if not self.configured:
+            return []
+        try:
+            resp = await self.client.post(
+                f"{TAVILY_BASE_URL}/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "search_depth": "advanced",
+                    "include_answer": False,
+                    "max_results": TAVILY_MAX_RESULTS,
+                },
+                timeout=TAVILY_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("results") or []
+        except Exception as exc:
+            LOG.warning("Tavily search failed for %r: %s", query[:60], exc)
+            return []
+
+    async def research_fixture(self, info: dict[str, Any],
+                               minutes_to_kickoff: Optional[int] = None) -> dict[str, Any]:
+        """为比赛搜索赛前资讯，离开赛越近越侧重确认首发。"""
+        if not self.configured:
+            return {"configured": False, "status": "not_configured", "results": []}
+        home = str(info.get("home") or "")
+        away = str(info.get("away") or "")
+        league = str(info.get("league") or "")
+        kickoff = str(info.get("date") or "")[:10]
+
+        if minutes_to_kickoff is not None and minutes_to_kickoff <= 90:
+            queries = [
+                f"{home} {away} confirmed starting lineup XI {kickoff}",
+                f"{home} {away} lineups formations {league} {kickoff}",
+            ]
+        else:
+            queries = [
+                f"{home} injury news squad update {kickoff}",
+                f"{away} injury news squad update {kickoff}",
+                f"{home} vs {away} predicted lineup {league} {kickoff}",
+            ]
+
+        all_results: list[dict[str, Any]] = []
+        for q in queries:
+            results = await self.search(q)
+            for r in results:
+                r["_source"] = "tavily"
+                r["_query"] = q
+            all_results.extend(results)
+
+        return {
+            "configured": True,
+            "status": "ok" if all_results else "no_results",
+            "results_count": len(all_results),
+            "results": all_results[:10],
         }
 
 
@@ -1189,17 +1282,67 @@ async def run_monte_carlo(bundle: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+async def _fetch_lineups_with_retry(
+    api: "FootballAPI",
+    fixture_id: int,
+    initial_response: list,
+    minutes_to_kickoff: Optional[int],
+    max_retries: int = 3,
+    retry_interval_seconds: int = 120,
+) -> list:
+    """
+    赛前 60 分钟内若阵容为空，每隔 retry_interval_seconds 重试一次，
+    最多重试 max_retries 次。解决"开球前半小时分析却拿不到首发阵容"的问题。
+    """
+    lineups = compact_lineups(initial_response)
+    if lineups:
+        return lineups
+    # 只在开球前 60 分钟内重试
+    if minutes_to_kickoff is None or minutes_to_kickoff > 60 or minutes_to_kickoff < -5:
+        return lineups
+    for attempt in range(max_retries):
+        LOG.info(
+            "Lineups empty for fixture %s, retrying in %ds (attempt %d/%d) …",
+            fixture_id, retry_interval_seconds, attempt + 1, max_retries,
+        )
+        await asyncio.sleep(retry_interval_seconds)
+        try:
+            result = await api.get("fixtures/lineups", {"fixture": fixture_id})
+            raw = result.get("response", []) if isinstance(result, dict) else []
+            lineups = compact_lineups(raw)
+            if lineups:
+                LOG.info("Lineups obtained for fixture %s after %d retries", fixture_id, attempt + 1)
+                return lineups
+        except Exception as exc:
+            LOG.warning("Lineup retry %d failed: %s", attempt + 1, exc)
+    LOG.warning("Lineups still empty for fixture %s after %d retries", fixture_id, max_retries)
+    return []
+
+
 async def collect_data(
     api: FootballAPI,
     exa: ExaClient,
     fixture: dict[str, Any],
     original: str,
+    tavily: Optional["TavilyClient"] = None,
 ) -> dict[str, Any]:
     info = compact_fixture(fixture)
     fixture_id = info["fixture_id"]
     league_id = fixture.get("league", {}).get("id")
     season = info["season"]
     home_id, away_id = info["home_id"], info["away_id"]
+
+    # ── 计算距开赛时间（分钟），用于搜索策略选择 ────────────────────
+    minutes_to_kickoff: Optional[int] = None
+    try:
+        kickoff_dt = datetime.fromisoformat(
+            str(info.get("date") or "").replace("Z", "+00:00")
+        )
+        delta = kickoff_dt - datetime.now(kickoff_dt.tzinfo)
+        minutes_to_kickoff = int(delta.total_seconds() / 60)
+    except Exception:
+        pass
+
     requests = [
         api.get("standings", {"league": league_id, "season": season}),
         api.get("teams/statistics", {"league": league_id, "season": season, "team": home_id}),
@@ -1210,7 +1353,9 @@ async def collect_data(
         api.get("injuries", {"fixture": fixture_id}),
         api.get("fixtures/lineups", {"fixture": fixture_id}),
         api.get("odds", {"fixture": fixture_id}),
-        exa.research_fixture(info),
+        exa.research_fixture(info, minutes_to_kickoff=minutes_to_kickoff),
+        (tavily.research_fixture(info, minutes_to_kickoff=minutes_to_kickoff)
+         if tavily and tavily.configured else _noop_coro()),
     ]
     results = await asyncio.gather(*requests, return_exceptions=True)
 
@@ -1232,34 +1377,56 @@ async def collect_data(
             "errors": [type(web_research).__name__],
             "notes": ["Exa research failed; do not treat API-Football lineup or injury data as independently verified."],
         }
+    # 合并 Tavily 结果
+    tavily_result = results[10] if len(results) > 10 else None
+    if isinstance(tavily_result, dict) and tavily_result.get("status") == "ok":
+        existing = web_research if isinstance(web_research, dict) else {}
+        merged_results = (existing.get("fetched_pages") or []) + [
+            {"source": "tavily", "url": r.get("url", ""), "title": r.get("title", ""),
+             "content": (r.get("content") or "")[:2000], "score": r.get("score")}
+            for r in (tavily_result.get("results") or [])
+        ]
+        existing["tavily_results"] = tavily_result.get("results", [])[:5]
+        existing["source_count"] = (
+            len({u.get("url","")[:40] for u in merged_results if u.get("url")})
+        )
+        web_research = existing
 
     return {
         "user_request": original,
         "collected_at": datetime.now(TZ).isoformat(),
         "fixture": info,
-        "standings": compact_standings(response(0)),        # 全联赛积分榜（无过滤）
+        "minutes_to_kickoff": minutes_to_kickoff,
+        "standings": compact_standings(response(0)),
         "home_statistics": compact_stats(response(1)),
         "away_statistics": compact_stats(response(2)),
         "home_recent": compact_recent(response(3)),
         "away_recent": compact_recent(response(4)),
         "head_to_head": compact_recent(response(5)),
         "injuries": compact_injuries(response(6)),
-        "lineups": compact_lineups(response(7)),
+        "lineups": await _fetch_lineups_with_retry(api, fixture_id, response(7), minutes_to_kickoff),
         "odds_match_winner": compact_odds(response(8)),
         "web_research": web_research,
         "data_notes": {
             "lineups_empty_means": "not published or unavailable; it does not prove a full-strength lineup",
             "injuries_empty_means": "unavailable or no records; treat as uncertain",
             "predictions_endpoint_used": False,
+            "minutes_to_kickoff_note": (
+                f"距开赛约{minutes_to_kickoff}分钟，官方首发可能已公布"
+                if minutes_to_kickoff is not None and minutes_to_kickoff <= 90
+                else "赛前数据"
+            ),
         },
     }
 
 
 class TelegramBot:
-    def __init__(self, client: httpx.AsyncClient, api: FootballAPI, exa: ExaClient, llm: LLMClient):
+    def __init__(self, client: httpx.AsyncClient, api: FootballAPI, exa: ExaClient,
+                 llm: LLMClient, tavily: Optional["TavilyClient"] = None):
         self.client = client
         self.api = api
         self.exa = exa
+        self.tavily = tavily
         self.llm = llm
         self.offset = 0
         self.busy: set[int] = set()
@@ -1273,6 +1440,9 @@ class TelegramBot:
             if self.admins:
                 self.save_admins()
         self.allowed.update(self.admins)
+        # Jingcai cache (10-minute TTL)
+        self._jc_matches_cache: list[dict] = []
+        self._jc_cache_ts: float = 0
 
     @property
     def base(self) -> str:
@@ -1383,6 +1553,130 @@ class TelegramBot:
             except Exception:
                 LOG.exception("Telegram polling failed")
                 await asyncio.sleep(5)
+
+    # ── 联赛质量权重（越高越优先自动推送）────────────────────────────────────
+    _LEAGUE_TIER: dict[int, int] = {
+        39: 10, 61: 10, 78: 10, 135: 10, 140: 10,   # 五大联赛
+        2: 9, 3: 9,                                    # 欧冠/欧联
+        88: 8, 94: 8, 179: 8, 203: 8, 218: 8,
+        239: 7, 235: 7, 128: 7, 233: 7, 253: 7, 262: 7, 169: 7, 265: 7,
+        40: 6, 62: 6, 79: 6, 136: 6, 141: 6,
+    }
+
+    def _score_fixture(self, fx: dict, now_ts: float) -> float:
+        """给比赛打分，返回负数表示跳过。"""
+        import time as _t
+        status = fx.get("fixture", {}).get("status", {}).get("short", "")
+        if status not in ("NS", "TBD"):
+            return -1
+        ts = fx.get("fixture", {}).get("timestamp", 0)
+        hours = (ts - now_ts) / 3600
+        if hours < 0.5 or hours > 36:
+            return -1
+        score = self._LEAGUE_TIER.get(fx.get("league", {}).get("id", 0), 4)
+        if 6 <= hours <= 18:
+            score += 2
+        elif 2 <= hours < 6:
+            score += 1
+        return score
+
+    async def _auto_push_once(self) -> None:
+        """拉取比赛、评分、推送到所有已绑定用户。"""
+        import time as _t
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        if not API_KEY:
+            return
+        cst = _tz(timedelta(hours=8))
+        now_ts = _t.time()
+        today = _dt.fromtimestamp(now_ts, tz=cst).strftime("%Y-%m-%d")
+        tomorrow = (_dt.fromtimestamp(now_ts, tz=cst) + _td(days=1)).strftime("%Y-%m-%d")
+
+        all_fixtures: list[dict] = []
+        for date_str in (today, tomorrow):
+            try:
+                payload = await self.api.get(
+                    "fixtures",
+                    {"date": date_str, "timezone": "Asia/Shanghai"},
+                )
+                all_fixtures.extend(payload.get("response", []))
+                await asyncio.sleep(0.5)
+            except Exception as exc:
+                LOG.warning("auto_push fixtures fetch failed %s: %s", date_str, exc)
+
+        scored = [(self._score_fixture(fx, now_ts), fx) for fx in all_fixtures]
+        scored = [(s, fx) for s, fx in scored if s > 0]
+        scored.sort(key=lambda x: -x[0])
+        top = scored[:6]
+
+        if not top:
+            LOG.info("auto_push: no eligible matches found")
+            return
+
+        lines = [
+            "🤖 <b>今日值得关注的比赛</b>",
+            f"📅 {today} 自动筛选（质量最高前{len(top)}场）",
+            "——————————————",
+        ]
+        for i, (sc, fx) in enumerate(top, 1):
+            f   = fx.get("fixture", {})
+            lg  = fx.get("league", {})
+            tms = fx.get("teams", {})
+            fid = f.get("id", "?")
+            ts  = f.get("timestamp", 0)
+            kickoff = _dt.fromtimestamp(ts, tz=cst).strftime("%m-%d %H:%M") if ts else "?"
+            hours_left = (ts - now_ts) / 3600 if ts else 0
+            hrs_str = f"{hours_left:.1f}h" if hours_left > 0 else "已开赛"
+            home = tms.get("home", {}).get("name", "?")
+            away = tms.get("away", {}).get("name", "?")
+            league = lg.get("name", "?")
+            country = lg.get("country", "?")
+            lines.append(
+                f"\n{i}. <b>{home}</b> vs <b>{away}</b>\n"
+                f"   🏆 {country} · {league}\n"
+                f"   🕐 {kickoff} 北京时间（{hrs_str}后）\n"
+                f"   📌 /analyze {fid}"
+            )
+        lines.append("\n——————————————")
+        lines.append("💡 发送 /analyze &lt;序号或球队名&gt; 开始详细分析")
+        message = "\n".join(lines)
+
+        for cid in list(self.allowed):
+            try:
+                await self.send(cid, message)
+            except Exception as exc:
+                LOG.warning("auto_push send to %s failed: %s", cid, exc)
+
+        LOG.info("auto_push: sent to %d chats, %d matches", len(self.allowed), len(top))
+
+    async def auto_push_loop(self) -> None:
+        """每天 09:00 和 17:00 北京时间自动推送高质量比赛。"""
+        import time as _t
+        from datetime import datetime as _dt, timezone as _tz
+
+        cst = _tz(timedelta(hours=8))
+        push_hours = {9, 17}  # 每天推送时间（北京时间）
+        last_pushed: set[str] = set()   # 记录已推送的 "YYYY-MM-DD-HH"
+
+        LOG.info("auto_push_loop started (push hours CST: %s)", push_hours)
+        while True:
+            try:
+                now = _dt.now(tz=cst)
+                key = now.strftime("%Y-%m-%d") + f"-{now.hour}"
+                if now.hour in push_hours and key not in last_pushed:
+                    LOG.info("auto_push_loop: triggering push at %s CST", now.strftime("%H:%M"))
+                    await self._auto_push_once()
+                    last_pushed.add(key)
+                    # 避免同一小时内重复触发
+                    await asyncio.sleep(3600)
+                else:
+                    # 休眠到下一分钟
+                    await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("auto_push_loop error")
+                await asyncio.sleep(60)
 
     @staticmethod
     def _llm_error_text(exc: LLMAPIError) -> str:
@@ -1534,6 +1828,7 @@ class TelegramBot:
                 "服务状态：运行中",
                 f"API-Football：{'已配置' if API_KEY else '未配置'}",
                 f"Exa 网络核验：{'已配置' if self.exa.configured else '未配置'}",
+                f"Tavily 搜索：{'已配置' if (self.tavily and self.tavily.configured) else '未配置'}",
                 f"LLM：{'已配置' if self.llm.configured else '未配置'}",
                 f"主模型：{self.llm.primary_model or '未配置'}",
                 f"备用模型：{fallbacks}",
@@ -1557,6 +1852,13 @@ class TelegramBot:
                 "  /calibration   — 模型校准数据（回测结果）",
                 "  /predictions   — 最近预测存档（最新5条）",
                 "  /leagues       — 已校准回测联赛列表",
+                "  /stats         — 模型参数 + Brier校准图",
+                "  /markets       — 各投注市场说明（1X2/亚盘/大小球/BTTS）",
+                "  /weekly        — 本周预测复盘",
+                "",
+                "🎰 竞彩指令",
+                "  /jingcai       — 今日竞彩在售比赛列表",
+                "  /jc <序号或ID> — 某场竞彩的五种玩法赔率分析",
                 "",
                 "⚙️ 管理",
                 "  /model         — 查看/切换 LLM 模型",
@@ -1656,6 +1958,154 @@ class TelegramBot:
                 "以上为已回测校准的联赛，预测更准确。",
             ]))
             return
+        if command == "/markets":
+            await self.send(chat_id, "\n".join([
+                "📊 支持的投注市场说明",
+                "",
+                "🏆 胜平负 (1X2)",
+                "  最基础市场。主胜/平局/客胜三选一。",
+                "  赔率效率通常最低，价值边际最难找。",
+                "",
+                "🥇 亚洲盘 (Asian Handicap)",
+                "  让分投注，消除平局。常见线位：",
+                "  -0.5 = 主队必须赢 | +0.5 = 主队不败即赢",
+                "  -1.0 = 主队赢2球+走水 | -1.5 = 主队必须赢2球",
+                "  赔率通常比1X2更有效率，强弱悬殊时首选。",
+                "",
+                "📈 大小球 (Over/Under)",
+                "  两队总进球数高于/低于某个线位。",
+                "  常见线位：大小1.5、2.5、3.5、4.5",
+                "  独立于谁赢，纯看比赛进球性。",
+                "",
+                "⚽ 双方进球 (BTTS - Both Teams to Score)",
+                "  两队各至少进1球（是/否）。",
+                "  两队均有进攻能力且防守均有漏洞时，",
+                "  BTTS=是 概率较高。",
+                "",
+                "💡 机器人分析时，以上四个市场均会独立评估，",
+                "   每个市场给出 ✅推荐 / ⚠️谨慎推荐 / 👁观察 / ❌无推荐",
+                "   某市场无推荐不影响其他市场的判断。",
+            ]))
+            return
+        if command == "/stats":
+            try:
+                params_file = STATE_DIR / "model_params.json"
+                results_file = STATE_DIR / "backtest_results.json"
+                lines = ["📊 预测模型统计"]
+                if params_file.exists():
+                    import json as _json
+                    p = _json.loads(params_file.read_text(encoding="utf-8"))
+                    lines += [
+                        "",
+                        f"🔢 回测场次：{p.get('n_matches', '?'):,} 场",
+                        f"📉 Brier 分数：{p.get('brier_score', '?')} （越低越好，随机=0.333）",
+                        f"🎯 准确率（Top-1）：{round(p.get('accuracy', 0)*100, 1)}%",
+                        f"📅 最后调参：{p.get('updated', '未知')}",
+                        "",
+                        "最优参数：",
+                        f"  DC ρ = {p.get('dc_rho', '?')}",
+                        f"  状态衰减 = {p.get('form_decay', '?')}",
+                        f"  DC权重 = {p.get('dc_weight', '?')}",
+                    ]
+                if results_file.exists():
+                    r = _json.loads(results_file.read_text(encoding="utf-8"))
+                    cal = r.get("calibration", {})
+                    if cal:
+                        lines += ["", "📐 校准（模型概率 vs 实际发生率）："]
+                        for bucket, v in cal.items():
+                            pred = v.get("pred_mean", 0)
+                            actual = v.get("actual_rate", 0)
+                            diff = actual - pred
+                            arrow = "↑" if diff > 0.03 else ("↓" if diff < -0.03 else "≈")
+                            lines.append(
+                                f"  {bucket}: 模型{pred:.1%} → 实际{actual:.1%} {arrow}"
+                            )
+                await self.send(chat_id, "\n".join(lines))
+            except Exception as exc:
+                await self.send(chat_id, f"获取模型统计失败：{type(exc).__name__}")
+            return
+        if command == "/weekly":
+            try:
+                import json as _json, glob as _glob
+                reviews_dir = STATE_DIR / "weekly_reviews"
+                files = sorted(_glob.glob(str(reviews_dir / "*.json")), reverse=True)
+                if not files:
+                    await self.send(chat_id,
+                        "暂无周复盘数据。\n"
+                        "运行 weekly_review.py 后可查看。")
+                    return
+                latest = _json.loads(Path(files[0]).read_text(encoding="utf-8"))
+                week = latest.get("week", files[0].split("/")[-1].replace(".json",""))
+                n = latest.get("n_resolved", 0)
+                acc = latest.get("accuracy")
+                brier = latest.get("brier_score")
+                lines = [
+                    f"📅 周复盘 — {week}",
+                    f"✅ 已结算预测：{n} 场",
+                ]
+                if acc is not None:
+                    lines.append(f"🎯 本周准确率：{round(acc*100,1)}%")
+                if brier is not None:
+                    lines.append(f"📉 本周 Brier：{brier:.4f}")
+                notes = latest.get("notes", [])
+                if notes:
+                    lines += ["", "📝 备注："] + [f"  • {n}" for n in notes[:5]]
+                await self.send(chat_id, "\n".join(lines))
+            except Exception as exc:
+                await self.send(chat_id, f"获取周复盘失败：{type(exc).__name__}")
+            return
+        if command == "/backtest":
+            if chat_id not in self.admins:
+                await self.send(chat_id, "⚠️ 此指令仅限管理员使用。")
+                return
+            await self.send(chat_id,
+                "🔄 正在后台启动回测（约需 20-30 分钟）...\n"
+                "完成后日志写入 /tmp/backtest_manual.log"
+            )
+            import subprocess as _sub
+            _sub.Popen(
+                [sys.executable, str(Path(__file__).parent / "backtest.py")],
+                stdout=open("/tmp/backtest_manual.log", "w"),
+                stderr=_sub.STDOUT,
+                cwd=str(Path(__file__).parent),
+            )
+            return
+        if command == "/jingcai" or command == "/jc":
+            if _jingcai is None:
+                await self.send(chat_id, "竞彩模块未加载，请联系管理员。")
+                return
+            import time as _time
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            # 如未配置代理且服务器在境外，提示用户
+            import os as _os
+            if not _os.environ.get("JINGCAI_PROXY"):
+                await self.send(chat_id,
+                    "⚠️ 竞彩 API（sporttery.cn）仅限中国大陆 IP 访问。\n"
+                    "服务器当前无法连接，有两种解决方案：\n"
+                    "1️⃣ 在服务器 .env 中设置 JINGCAI_PROXY=http://代理地址:端口\n"
+                    "2️⃣ 在本地（国内）Windows 机器运行 auto_push.py，\n"
+                    "   它会直接抓取竞彩数据并推送到本聊天。\n\n"
+                    "💡 本地运行方法：\n"
+                    "cd football-bot-work && python auto_push.py --dry-run"
+                )
+                return
+            # 刷新缓存（10分钟TTL）
+            if not self._jc_matches_cache or _time.time() - self._jc_cache_ts > 600:
+                await self.send(chat_id, "📡 正在获取竞彩比赛数据...")
+                try:
+                    self._jc_matches_cache = await _jingcai.fetch_jingcai(self.client)
+                    self._jc_cache_ts = _time.time()
+                except Exception as exc:
+                    LOG.warning("Jingcai fetch error: %s", exc)
+                    self._jc_matches_cache = []
+            if arg:
+                # 详细分析某场比赛
+                msg = _jingcai.format_jingcai_detail(arg, self._jc_matches_cache)
+            else:
+                # 列出今日竞彩比赛
+                msg = _jingcai.format_jingcai_list(self._jc_matches_cache)
+            await self.send(chat_id, msg)
+            return
         query = parse_query(text)
         if not query:
             await self.send(
@@ -1695,7 +2145,8 @@ class TelegramBot:
                 f"{identity['home']} vs {identity['away']}\n"
                 f"开球：{identity['date']}\nFixture ID：{identity['fixture_id']}",
             )
-            bundle = await collect_data(self.api, self.exa, fixture, query.original)
+            bundle = await collect_data(self.api, self.exa, fixture, query.original,
+                                        tavily=self.tavily)
             bundle["strength_model"] = compute_strength_safe(bundle)
             bundle["monte_carlo"] = await run_monte_carlo(bundle)
             report = await self.llm.analyze(bundle)
@@ -1722,10 +2173,14 @@ async def main() -> None:
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         api = FootballAPI(client)
         exa = ExaClient(client)
+        tavily = TavilyClient(client)
         llm = LLMClient(client)
-        bot = TelegramBot(client, api, exa, llm)
+        bot = TelegramBot(client, api, exa, llm, tavily=tavily)
         await bot.initialize()
-        await bot.poll()
+        await asyncio.gather(
+            bot.poll(),
+            bot.auto_push_loop(),
+        )
 
 
 if __name__ == "__main__":
