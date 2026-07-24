@@ -62,6 +62,10 @@ _HEADERS = {
 # 例如：JINGCAI_PROXY=http://127.0.0.1:7890
 _PROXY = os.environ.get("JINGCAI_PROXY", "").strip() or None
 
+# 设置 JINGCAI_RELAY_URL 可通过大陆 Serverless 函数中继访问（优先级高于直连和代理）
+# 例如：JINGCAI_RELAY_URL=https://1457975165-9m72an2vb1.ap-guangzhou.tencentscf.com
+_RELAY_URL = os.environ.get("JINGCAI_RELAY_URL", "").strip() or None
+
 # ── 比分字段映射 ────────────────────────────────────────────────────────────
 # crs 字段格式：s{主}s{客}，例如 s02s01 = 主队2:客队1
 _CRS_DISPLAY = {
@@ -199,16 +203,34 @@ async def fetch_jingcai(client) -> list[dict]:
     """获取今日竞彩比赛数据。client 为 httpx.AsyncClient。
 
     优先级：
-    1. 读取本地中继缓存文件（由大陆机器运行 jingcai_relay.py 上传）
-    2. 若缓存不存在/过期，则直连 API（需要大陆IP，境外服务器会被 geo-block）
-    3. 若设置了 JINGCAI_PROXY 环境变量，通过代理直连（备用）
+    1. JINGCAI_RELAY_URL（腾讯云/阿里云 Serverless 函数中继，大陆IP直连）
+    2. 本地中继缓存文件（由大陆机器运行 jingcai_relay.py 上传）
+    3. 直连 API（需要大陆IP，境外服务器会被 geo-block）
+    4. JINGCAI_PROXY 代理（备用）
     """
-    # 1. 先尝试本地缓存
+    # 1. 优先使用 Serverless 中继 URL（透明代理 sporttery.cn）
+    if _RELAY_URL:
+        try:
+            r = await client.get(_RELAY_URL, timeout=25)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("success"):
+                matches: list[dict] = []
+                for day_group in data.get("value", {}).get("matchInfoList", []):
+                    for sub in day_group.get("subMatchList", []):
+                        if sub.get("matchStatus") == "Selling":
+                            matches.append(sub)
+                LOG.info("竞彩从中继URL获取：%d 场", len(matches))
+                return matches
+        except Exception as exc:
+            LOG.warning("竞彩中继URL请求失败 (%s): %s", _RELAY_URL, exc)
+
+    # 2. 尝试本地缓存文件
     cached = _load_cache()
     if cached:
         return cached
 
-    # 2. 缓存不可用，尝试直连 API（境外服务器通常失败，记录日志即可）
+    # 3. 缓存不可用，尝试直连 API（境外服务器通常失败，记录日志即可）
     import httpx as _httpx
     try:
         if _PROXY:
